@@ -8,6 +8,7 @@ void IMU_error();
 void IMU_read();
 void Madgwick();
 void angleControl();
+void rateControl();
 void outputMix();
 bool checkPWM();
 void looprate(int);
@@ -41,20 +42,22 @@ float q2 = 0.0f;
 float q3 = 0.0f;
 
 //Control vars
-float roll_desired, pitch_desired, yaw_desired, roll_error, pitch_error, yaw_error, roll_pid, pitch_pid, yaw_pid;
+float roll_desired, pitch_desired, yaw_desired, roll_pid, pitch_pid, yaw_pid;
+float roll_error, pitch_error, yaw_error, roll_errorPrev, pitch_errorPrev, yaw_errorPrev;
 float p_roll, i_roll, iPrev_roll, d_roll, p_pitch, i_pitch, iPrev_pitch, d_pitch, p_yaw, i_yaw, iPrev_yaw, d_yaw;
-float kp_roll = 1.3, ki_roll = 0.04, kd_roll = 18.0;
-float kp_pitch = 1.3, ki_pitch = 0.04, kd_pitch = 18.0;
+float kp_rollAngle = 1.3, ki_rollAngle = 0.04, kd_rollAngle = 18.0;
+float kp_pitchAngle = 1.3, ki_pitchAngle = 0.04, kd_pitchAngle = 18.0;
 float kp_yaw = 4.0, ki_yaw = 0.02, kd_yaw = 0.0;
+
+float kp_rollRate = 1.0, ki_rollRate = 0.04, kd_rollRate = 0.1;
+float kp_pitchRate = 1.0, ki_pitchRate = 0.04, kd_pitchRate = 0.1;
 
 
 float output_Throt, output_portAil, output_stbdAil, output_Elev;
 float output_M1, output_M2, output_M3, output_M4;
 
-
+bool boot = 1;
 bool failsafe;
-bool connectstate = 1;
-bool prevfailsafe = 1;
 
 Servo servo1;
 Servo servo2;
@@ -92,48 +95,45 @@ void setup() {
 }
 
 void loop() {
+  //buzzer high on rc disconnect
   failsafe = checkPWM();
-
-  if((failsafe - prevfailsafe) < 0){
-    connectstate = 1;
-  }
-  else if((failsafe - prevfailsafe) > 0){
-    connectstate = 0;
-  }
-  prevfailsafe = failsafe;
-
-  if (connectstate == 0){
+  //only buzz if remote connect then disconnect
+  if ((boot == 0)&(failsafe == 1)){
     digitalWrite(12,HIGH);
   }
-  else if(connectstate == 1){
+  else if(failsafe == 0){
     digitalWrite(12, LOW);
   }
 
-
+  //get imu data, calculate vehicle attitude
   IMU_read();
   time_prev = time_current;
   time_current = micros();
   dt = (time_current - time_prev)/1000000.0;
   Madgwick();
 
-  //deadband
+  //deadband of 32us
   if((input_roll < 1516) & (input_roll > 1484)){
     input_roll = 1500;
   }
   if((input_pitch < 1516) & (input_pitch > 1484)){
     input_pitch = 1500;
   }
-  if((input_yaw < 1520) & (input_yaw > 1480)){
+  if((input_yaw < 1516) & (input_yaw > 1484)){
     input_yaw = 1500;
   }
 
-  roll_desired = map(input_roll, 1000, 2000, -10, 10);
-  pitch_desired = map(input_pitch, 1000, 2000, -10, 10);
-  yaw_desired = -1*map(input_yaw, 1000, 2000, -30, 30);
 
 
+  //attitude control
+  if(input_aux1 > 1500){
+    rateControl();
+  }
+  else{
+    angleControl();
+  }
 
-  angleControl();
+
   outputMix();
   if(input_throttle < 1080){
     output_M1 = 0;
@@ -142,22 +142,35 @@ void loop() {
     output_M4 = 0;
 
   }
-  
+  //motor output
   servo1.writeMicroseconds(output_M1);
   servo2.writeMicroseconds(output_M2);
   servo3.writeMicroseconds(output_M3);
   servo4.writeMicroseconds(output_M4);
 
   //print functions
-  // print_pid();
+  print_pid();
   // print_input();
   // print_desired();
 
-
-
-
   looprate(250);
   //print_looptime();
+}
+
+bool checkPWM(){
+  if(input_throttle < 1030){
+    input_throttle = 1000;
+    input_roll = 1500;
+    input_pitch = 1500;
+    input_yaw = 1500;
+    input_aux1 = 1000;
+    input_aux2 = 1000;
+    return(HIGH);
+  }
+  else{
+    boot = 0;
+    return(LOW);
+  }
 }
 
 
@@ -362,19 +375,23 @@ void Madgwick() {
 }
 
 void angleControl(){
+  //map input to desired angle
+  roll_desired = map(input_roll, 1000, 2000, -10, 10);
+  pitch_desired = map(input_pitch, 1000, 2000, -10, 10);
+  yaw_desired = -1*map(input_yaw, 1000, 2000, -30, 30);
   //error
-  roll_error = roll_desired - roll_measured;
-  pitch_error = pitch_desired - pitch_measured;
-  yaw_error = yaw_desired - Gz;
+  roll_error = roll_desired - roll_measured;//degrees
+  pitch_error = pitch_desired - pitch_measured;//degrees
+  yaw_error = yaw_desired - Gz;//degrees/s
   //proportional control
-  p_roll = kp_roll*roll_error;
-  p_pitch = kp_pitch*pitch_error;
+  p_roll = kp_rollAngle*roll_error;
+  p_pitch = kp_pitchAngle*pitch_error;
   p_yaw = kp_yaw*yaw_error;
   //integral control
   i_roll = iPrev_roll + roll_error*dt;
-  i_roll = ki_roll*constrain(i_roll, -25, 25);
+  i_roll = ki_rollAngle*constrain(i_roll, -25, 25);
   i_pitch = iPrev_pitch + pitch_error*dt;
-  i_pitch = ki_pitch*constrain(i_pitch, -25, 25);
+  i_pitch = ki_pitchAngle*constrain(i_pitch, -25, 25);
   i_yaw = iPrev_yaw + yaw_error*dt;
   i_yaw = ki_yaw*constrain(i_yaw, -25, 25);
   if(input_throttle < 1080){
@@ -383,23 +400,62 @@ void angleControl(){
     i_yaw = 0;
   }
   //derivative control
-  d_roll = -kd_roll*Gx;
-  d_pitch = -kd_pitch*Gy;
-  d_yaw = -kd_yaw*Gz;
-
+  d_roll = -kd_rollAngle*Gx;
+  d_pitch = -kd_pitchAngle*Gy;
+  d_yaw = -kd_yaw*((yaw_error - yaw_errorPrev)/dt);
   //output
   roll_pid = constrain(p_roll + i_roll + d_roll,-400, 400);
-
   pitch_pid = constrain(p_pitch + i_pitch + d_pitch, -400, 400);
-
   yaw_pid = constrain(p_yaw + i_yaw + d_yaw, -400, 400);
-
+  //update vars
   iPrev_roll = i_roll;
   iPrev_pitch = i_pitch;
   iPrev_yaw = i_yaw;
+  yaw_errorPrev = yaw_error;
 
 }
 
+void rateControl(){
+  //map input to desired rates
+  roll_desired = map(input_roll, 1000, 2000, -30, 30);
+  pitch_desired = map(input_pitch, 1000, 2000, -30, 30);
+  yaw_desired = -1*map(input_yaw, 1000, 2000, -30, 30);
+  //error
+  roll_error = roll_desired - Gx;//degrees/s
+  pitch_error = pitch_desired - Gy;//degrees/s
+  yaw_error = yaw_desired - Gz;//degrees/s
+  //proportional control
+  p_roll = kp_rollRate*roll_error;
+  p_pitch = kp_pitchRate*pitch_error;
+  p_yaw = kp_yaw*yaw_error;
+  //integral control
+  i_roll = iPrev_roll + roll_error*dt;
+  i_roll = ki_rollRate*constrain(i_roll, -25, 25);
+  i_pitch = iPrev_pitch + pitch_error*dt;
+  i_pitch = ki_pitchRate*constrain(i_pitch, -25, 25);
+  i_yaw = iPrev_yaw + yaw_error*dt;
+  i_yaw = ki_yaw*constrain(i_yaw, -25, 25);
+  if(input_throttle < 1080){
+    i_roll = 0;
+    i_pitch = 0;
+    i_yaw = 0;
+  }
+  //derivative control
+  d_roll = -kd_rollRate*((roll_error - roll_errorPrev)/dt);
+  d_pitch = -kd_pitchRate*((pitch_error - pitch_errorPrev)/dt);
+  d_yaw = -kd_yaw*((yaw_error - yaw_errorPrev)/dt);
+  //output
+  roll_pid = constrain(p_roll + i_roll + d_roll,-400, 400);
+  pitch_pid = constrain(p_pitch + i_pitch + d_pitch, -400, 400);
+  yaw_pid = constrain(p_yaw + i_yaw + d_yaw, -400, 400);
+  //update vars
+  iPrev_roll = i_roll;
+  iPrev_pitch = i_pitch;
+  iPrev_yaw = i_yaw;
+  roll_errorPrev = roll_error;
+  pitch_errorPrev = pitch_error;
+  yaw_errorPrev = yaw_error;
+}
 void outputMix(){
   // output_portAil = constrain(roll_pid,-500.0, 500.0) + 1500.0;
   // output_stbdAil = constrain(roll_pid,-500.0, 500.0) + 1500.0;
@@ -500,20 +556,7 @@ void print_desired(){
   Serial.println(",");
 }
 
-bool checkPWM(){
-  if(input_throttle < 1030){
-    input_throttle = 1000;
-    input_roll = 1500;
-    input_pitch = 1500;
-    input_yaw = 1500;
-    input_aux1 = 1000;
-    input_aux2 = 1000;
-    return(HIGH);
-  }
-  else{
-    return(LOW);
-  }
-}
+
 
 ISR(PCINT2_vect){
   current_count = micros();
