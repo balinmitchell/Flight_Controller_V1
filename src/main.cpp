@@ -1,6 +1,9 @@
 #include <Arduino.h>
-#include <Wire.h>
+#include "CRSFforArduino.h"
 #include <Servo.h>
+#include <Wire.h>
+
+CRSFforArduino crsf = CRSFforArduino();
 
 //function declaration
 void IMU_init();
@@ -8,23 +11,20 @@ void IMU_error();
 void IMU_read();
 void Madgwick();
 void angleControl();
-void rateControl();
-void outputMix();
-bool checkPWM();
+// void rateControl();
 void looprate(int);
 float invSqrt(float);
 void print_pid();
 void print_input();
 void print_desired();
+void print_tunePitch();
+void print_tuneRoll();
+void print_tuneYaw();
+
 
 //time vars
 unsigned long time_current, time_prev;
 float dt;
-
-//PWM Read Variables
-unsigned long counter_1, counter_2, counter_3, counter_4, counter_5, counter_6, current_count;
-byte last_CH1_state, last_CH2_state, last_CH3_state, last_CH4_state, last_CH5_state, last_CH6_state;
-int input_throttle, input_roll, input_pitch, input_yaw, input_aux1, input_aux2;
 
 //IMU Vars
 int MPU6050 = 0x68;
@@ -56,122 +56,87 @@ float kp_pitchRate = 1.0, ki_pitchRate = 0.04, kd_pitchRate = 0.1;
 float output_Throt, output_portAil, output_stbdAil, output_Elev;
 float output_M1, output_M2, output_M3, output_M4;
 
+byte roll_limit = 30, pitch_limit = 30;
+
+
 bool boot = 1;
 bool failsafe;
 
-Servo servo1;
-Servo servo2;
-Servo servo3;
-Servo servo4;
+Servo aileronPort;
+Servo aileronStbd;
+Servo elevator;
+Servo throttle;
 
 
 void setup() {
-  PCICR  |= B00000101;  //Enable PCMSK0 and PCMSK2 Scan
-  PCMSK0 |= B00000001;
-  PCMSK2 |= B11110100;
+  //begin serial comms
+  Serial.begin(115200);
 
-  
-
-  Serial.begin(9600);
-
-  pinMode(12, OUTPUT); //buzzer
-  pinMode(13, OUTPUT); //light
-
-
+  //heartbeat
+  pinMode(13, OUTPUT); 
   digitalWrite(13, HIGH);
+  
+  //begin crsf comms
+  if(!crsf.begin()){
+    Serial.println("Failed");
+    while(1){
+        ;
+    }
+  }
+
+  //initialise IMU and calulate error
   IMU_init();
   IMU_error();
+
+  //attach servos
+  aileronPort.attach(4);
+  aileronStbd.attach(5);
+  elevator.attach(6);
+  throttle.attach(11);
+
+  //setup complete
   digitalWrite(13, LOW);
-
-  servo1.attach(3, 900, 2100);
-  servo1.writeMicroseconds(1000);
-  servo2.attach(9, 900, 2100);
-  servo2.writeMicroseconds(1000);
-  servo3.attach(10, 900, 2100);
-  servo3.writeMicroseconds(1000);
-  servo4.attach(11, 900, 2100);
-  servo4.writeMicroseconds(1000);
-
+  Serial.println("Ready!");
 }
 
 void loop() {
-  //buzzer high on rc disconnect
-  failsafe = checkPWM();
-  //only buzz if remote connect then disconnect
-  if ((boot == 0)&(failsafe == 1)){
-    digitalWrite(12,HIGH);
-  }
-  else if(failsafe == 0){
-    digitalWrite(12, LOW);
-  }
-
-  //get imu data, calculate vehicle attitude
-  IMU_read();
+  //timing
   time_prev = time_current;
   time_current = micros();
   dt = (time_current - time_prev)/1000000.0;
+
+  //update crsf
+  crsf.update();
+
+  //update IMU, calculate vehicle attitude
+  IMU_read();
   Madgwick();
 
-  //deadband of 32us
-  if((input_roll < 1516) & (input_roll > 1484)){
-    input_roll = 1500;
-  }
-  if((input_pitch < 1516) & (input_pitch > 1484)){
-    input_pitch = 1500;
-  }
-  if((input_yaw < 1516) & (input_yaw > 1484)){
-    input_yaw = 1500;
-  }
+  //angle controller
+  angleControl();
+
+  //servo output
+  aileronPort.writeMicroseconds(roll_pid);
+  aileronStbd.writeMicroseconds(roll_pid);
+  elevator.writeMicroseconds(pitch_pid);
+  throttle.writeMicroseconds(crsf.readRcChannel(3));
 
 
-
-  //attitude control
-  if(input_aux1 > 1500){
-    rateControl();
-  }
-  else{
-    angleControl();
-  }
+  looprate(2000);
 
 
-  outputMix();
-  if(input_throttle < 1080){
-    output_M1 = 0;
-    output_M2 = 0;
-    output_M3 = 0;
-    output_M4 = 0;
-
-  }
-  //motor output
-  servo1.writeMicroseconds(output_M1);
-  servo2.writeMicroseconds(output_M2);
-  servo3.writeMicroseconds(output_M3);
-  servo4.writeMicroseconds(output_M4);
-
-  //print functions
-  print_pid();
+  //debugging print functions
+  // print_looptime();
+  // print_pid();
   // print_input();
   // print_desired();
+  // print_tunePitch();
+  // print_tuneRoll();
+  // print_tuneYaw();
 
-  looprate(250);
-  //print_looptime();
 }
 
-bool checkPWM(){
-  if(input_throttle < 1030){
-    input_throttle = 1000;
-    input_roll = 1500;
-    input_pitch = 1500;
-    input_yaw = 1500;
-    input_aux1 = 1000;
-    input_aux2 = 1000;
-    return(HIGH);
-  }
-  else{
-    boot = 0;
-    return(LOW);
-  }
-}
+
 
 
 
@@ -199,14 +164,14 @@ void IMU_init(){
 }
 
 void IMU_error(){
-  int iterations = 1000;
+  int iterations = 5000;
   //Acc error
   int i = 0;
   while(i < iterations){
     Wire.beginTransmission(MPU6050);
     Wire.write(0x3B);
     Wire.endTransmission(false);
-    Wire.requestFrom(MPU6050, 6, true);
+    Wire.requestFrom(MPU6050, 6);
     Ax = ( Wire.read() << 8| Wire.read());
     Ax = Ax/16384.0;
     Ay = ( Wire.read() << 8| Wire.read());
@@ -233,7 +198,7 @@ void IMU_error(){
     Wire.beginTransmission(MPU6050);
     Wire.write(0x43);
     Wire.endTransmission(false);
-    Wire.requestFrom(MPU6050, 6, true);
+    Wire.requestFrom(MPU6050, 6);
     Gx = ( Wire.read() << 8| Wire.read());
     Gx = Gx/131.0;
     Gy = ( Wire.read() << 8| Wire.read());
@@ -260,7 +225,7 @@ void IMU_read(){
   Wire.beginTransmission(MPU6050);
   Wire.write(0x3B);
   Wire.endTransmission(false);
-  Wire.requestFrom(MPU6050, 6, true);
+  Wire.requestFrom(MPU6050, 6);
     Ax = (Wire.read() << 8| Wire.read());
     Ax = Ax/16384.0;
     Ay = (Wire.read() << 8| Wire.read());
@@ -284,7 +249,7 @@ void IMU_read(){
   Wire.beginTransmission(MPU6050);
   Wire.write(0x43);
   Wire.endTransmission(false);
-  Wire.requestFrom(MPU6050, 6, true);
+  Wire.requestFrom(MPU6050, 6);
     Gx = (Wire.read() << 8| Wire.read());
     Gx = Gx/131.0;
     Gy = (Wire.read() << 8| Wire.read());
@@ -376,106 +341,75 @@ void Madgwick() {
 
 void angleControl(){
   //map input to desired angle
-  roll_desired = map(input_roll, 1000, 2000, -10, 10);
-  pitch_desired = map(input_pitch, 1000, 2000, -10, 10);
-  yaw_desired = -1*map(input_yaw, 1000, 2000, -30, 30);
+  roll_desired = map(crsf.readRcChannel(1), 1000, 2000, -roll_limit, roll_limit);
+  pitch_desired = map(crsf.readRcChannel(2), 1000, 2000, -pitch_limit, pitch_limit);
   //error
   roll_error = roll_desired - roll_measured;//degrees
   pitch_error = pitch_desired - pitch_measured;//degrees
-  yaw_error = yaw_desired - Gz;//degrees/s
   //proportional control
   p_roll = kp_rollAngle*roll_error;
   p_pitch = kp_pitchAngle*pitch_error;
-  p_yaw = kp_yaw*yaw_error;
   //integral control
   i_roll = iPrev_roll + roll_error*dt;
   i_roll = ki_rollAngle*constrain(i_roll, -25, 25);
   i_pitch = iPrev_pitch + pitch_error*dt;
   i_pitch = ki_pitchAngle*constrain(i_pitch, -25, 25);
-  i_yaw = iPrev_yaw + yaw_error*dt;
-  i_yaw = ki_yaw*constrain(i_yaw, -25, 25);
-  if(input_throttle < 1080){
+  if(crsf.readRcChannel(3) < 1080){
     i_roll = 0;
     i_pitch = 0;
-    i_yaw = 0;
   }
   //derivative control
   d_roll = -kd_rollAngle*Gx;
   d_pitch = -kd_pitchAngle*Gy;
-  d_yaw = -kd_yaw*((yaw_error - yaw_errorPrev)/dt);
   //output
   roll_pid = constrain(p_roll + i_roll + d_roll,-400, 400);
   pitch_pid = constrain(p_pitch + i_pitch + d_pitch, -400, 400);
-  yaw_pid = constrain(p_yaw + i_yaw + d_yaw, -400, 400);
   //update vars
   iPrev_roll = i_roll;
   iPrev_pitch = i_pitch;
-  iPrev_yaw = i_yaw;
-  yaw_errorPrev = yaw_error;
-
 }
 
-void rateControl(){
-  //map input to desired rates
-  roll_desired = map(input_roll, 1000, 2000, -30, 30);
-  pitch_desired = map(input_pitch, 1000, 2000, -30, 30);
-  yaw_desired = -1*map(input_yaw, 1000, 2000, -30, 30);
-  //error
-  roll_error = roll_desired - Gx;//degrees/s
-  pitch_error = pitch_desired - Gy;//degrees/s
-  yaw_error = yaw_desired - Gz;//degrees/s
-  //proportional control
-  p_roll = kp_rollRate*roll_error;
-  p_pitch = kp_pitchRate*pitch_error;
-  p_yaw = kp_yaw*yaw_error;
-  //integral control
-  i_roll = iPrev_roll + roll_error*dt;
-  i_roll = ki_rollRate*constrain(i_roll, -25, 25);
-  i_pitch = iPrev_pitch + pitch_error*dt;
-  i_pitch = ki_pitchRate*constrain(i_pitch, -25, 25);
-  i_yaw = iPrev_yaw + yaw_error*dt;
-  i_yaw = ki_yaw*constrain(i_yaw, -25, 25);
-  if(input_throttle < 1080){
-    i_roll = 0;
-    i_pitch = 0;
-    i_yaw = 0;
-  }
-  //derivative control
-  d_roll = -kd_rollRate*((roll_error - roll_errorPrev)/dt);
-  d_pitch = -kd_pitchRate*((pitch_error - pitch_errorPrev)/dt);
-  d_yaw = -kd_yaw*((yaw_error - yaw_errorPrev)/dt);
-  //output
-  roll_pid = constrain(p_roll + i_roll + d_roll,-400, 400);
-  pitch_pid = constrain(p_pitch + i_pitch + d_pitch, -400, 400);
-  yaw_pid = constrain(p_yaw + i_yaw + d_yaw, -400, 400);
-  //update vars
-  iPrev_roll = i_roll;
-  iPrev_pitch = i_pitch;
-  iPrev_yaw = i_yaw;
-  roll_errorPrev = roll_error;
-  pitch_errorPrev = pitch_error;
-  yaw_errorPrev = yaw_error;
-}
-void outputMix(){
-  // output_portAil = constrain(roll_pid,-500.0, 500.0) + 1500.0;
-  // output_stbdAil = constrain(roll_pid,-500.0, 500.0) + 1500.0;
-  // output_Elev = constrain(pitch_pid,-500.0, 500.0) + 1500.0;
-  // output_Throt = input_throttle;
-
-
-  output_M1 = input_throttle - pitch_pid + roll_pid + yaw_pid; //Front Left
-  output_M2 = input_throttle - pitch_pid - roll_pid - yaw_pid; //Front Right
-  output_M3 = input_throttle + pitch_pid - roll_pid + yaw_pid; //Back Right
-  output_M4 = input_throttle + pitch_pid + roll_pid - yaw_pid; //Back Left
-
-  output_M1 = constrain(output_M1, 1000, 2000);
-  output_M2 = constrain(output_M2, 1000, 2000);
-  output_M3 = constrain(output_M3, 1000, 2000);
-  output_M4 = constrain(output_M4, 1000, 2000);
-
-
-}
-
+// void rateControl(){
+//   //map input to desired rates
+//   roll_desired = map(input_roll, 1000, 2000, -30, 30);
+//   pitch_desired = map(input_pitch, 1000, 2000, -30, 30);
+//   yaw_desired = -1*map(input_yaw, 1000, 2000, -30, 30);
+//   //error
+//   roll_error = roll_desired - Gx;//degrees/s
+//   pitch_error = pitch_desired - Gy;//degrees/s
+//   yaw_error = yaw_desired - Gz;//degrees/s
+//   //proportional control
+//   p_roll = kp_rollRate*roll_error;
+//   p_pitch = kp_pitchRate*pitch_error;
+//   p_yaw = kp_yaw*yaw_error;
+//   //integral control
+//   i_roll = iPrev_roll + roll_error*dt;
+//   i_roll = ki_rollRate*constrain(i_roll, -25, 25);
+//   i_pitch = iPrev_pitch + pitch_error*dt;
+//   i_pitch = ki_pitchRate*constrain(i_pitch, -25, 25);
+//   i_yaw = iPrev_yaw + yaw_error*dt;
+//   i_yaw = ki_yaw*constrain(i_yaw, -25, 25);
+//   if(input_throttle < 1080){
+//     i_roll = 0;
+//     i_pitch = 0;
+//     i_yaw = 0;
+//   }
+//   //derivative control
+//   d_roll = -kd_rollRate*((roll_error - roll_errorPrev)/dt);
+//   d_pitch = -kd_pitchRate*((pitch_error - pitch_errorPrev)/dt);
+//   d_yaw = -kd_yaw*((yaw_error - yaw_errorPrev)/dt);
+//   //output
+//   roll_pid = constrain(p_roll + i_roll + d_roll,-400, 400);
+//   pitch_pid = constrain(p_pitch + i_pitch + d_pitch, -400, 400);
+//   yaw_pid = constrain(p_yaw + i_yaw + d_yaw, -400, 400);
+//   //update vars
+//   iPrev_roll = i_roll;
+//   iPrev_pitch = i_pitch;
+//   iPrev_yaw = i_yaw;
+//   roll_errorPrev = roll_error;
+//   pitch_errorPrev = pitch_error;
+//   yaw_errorPrev = yaw_error;
+// }
 
 void looprate(int rate){
   unsigned long time_check = micros();
@@ -530,17 +464,23 @@ void print_pid(){
 }
 
 void print_input(){
-  Serial.print(input_throttle);
-  Serial.print(",");
-  Serial.print(input_roll);
-  Serial.print(",");
-  Serial.print(input_pitch);
-  Serial.print(",");
-  Serial.print(input_yaw);
-  Serial.print(",");
-  Serial.print(input_aux1);
-  Serial.print(",");
-  Serial.println(input_aux2);
+  Serial.print("RC Channels <A: ");
+  Serial.print(crsf.readRcChannel(1));
+  Serial.print(", E: ");
+  Serial.print(crsf.readRcChannel(2));
+  Serial.print(", T: ");
+  Serial.print(crsf.readRcChannel(3));
+  Serial.print(", R: ");
+  Serial.print(crsf.readRcChannel(4));
+  Serial.print(", Aux1: ");
+  Serial.print(crsf.readRcChannel(5));
+  Serial.print(", Aux2: ");
+  Serial.print(crsf.readRcChannel(6));
+  Serial.print(", Aux3: ");
+  Serial.print(crsf.readRcChannel(7));
+  Serial.print(", Aux4: ");
+  Serial.print(crsf.readRcChannel(8));
+  Serial.println(">");
 }
 
 void print_looptime(){
@@ -557,84 +497,59 @@ void print_desired(){
 }
 
 
-
-ISR(PCINT2_vect){
-  current_count = micros();
-
-  //Channel 1
-  if(PIND & B00000100){
-    if(last_CH1_state == 0){
-      last_CH1_state = 1;
-      counter_1 = current_count;
-    }
-  }
-  else if(last_CH1_state == 1){
-    last_CH1_state = 0;
-    input_throttle = current_count - counter_1;
-  }
-
-  //Channel 2
-  if(PIND & B00010000){
-    if(last_CH2_state == 0){
-      last_CH2_state = 1;
-      counter_2 = current_count;
-    }
-  }
-  else if(last_CH2_state == 1){
-    last_CH2_state = 0;
-    input_roll = current_count - counter_2;
-  }
-
-  //Channel 3
-  if(PIND & B00100000){
-    if(last_CH3_state == 0){
-      last_CH3_state = 1;
-      counter_3 = current_count;
-    }
-  }
-  else if(last_CH3_state == 1){
-    last_CH3_state = 0;
-    input_pitch = current_count - counter_3;
-  }
-
-  //Channel 4
-  if(PIND & B01000000){
-    if(last_CH4_state == 0){
-      last_CH4_state = 1;
-      counter_4 = current_count;
-    }
-  }
-  else if(last_CH4_state == 1){
-    last_CH4_state = 0;
-    input_yaw = current_count - counter_4;
-  }
-
-  //Channel 5
-  if(PIND & B10000000){
-    if(last_CH5_state == 0){
-      last_CH5_state = 1;
-      counter_5 = current_count;
-    }
-  }
-  else if(last_CH5_state == 1){
-    last_CH5_state = 0;
-    input_aux1 = current_count - counter_5;
-  }
+void print_tunePitch(){
+  Serial.print(millis());
+  Serial.print(", ");
+  Serial.print(pitch_desired);
+  Serial.print(", ");
+  Serial.print(pitch_measured);
+  Serial.print(", ");
+  Serial.print(pitch_error);
+  Serial.print(", ");
+  Serial.print(pitch_pid);
+  Serial.print(", ");
+  Serial.print(p_pitch);
+  Serial.print(", ");
+  Serial.print(i_pitch);
+  Serial.print(", ");
+  Serial.print(d_pitch);
+  Serial.println(", ");
 }
 
-ISR(PCINT0_vect){
-  current_count = micros();
+void print_tuneRoll(){
+  Serial.print(millis());
+  Serial.print(", ");
+  Serial.print(roll_desired);
+  Serial.print(", ");
+  Serial.print(roll_measured);
+  Serial.print(", ");
+  Serial.print(roll_error);
+  Serial.print(", ");
+  Serial.print(roll_pid);
+  Serial.print(", ");
+  Serial.print(p_roll);
+  Serial.print(", ");
+  Serial.print(i_roll);
+  Serial.print(", ");
+  Serial.print(d_roll);
+  Serial.println(", ");
+}
 
-  //Channel 1
-  if(PINB & B00000001){
-    if(last_CH6_state == 0){
-      last_CH6_state = 1;
-      counter_6 = current_count;
-    }
-  }
-  else if(last_CH6_state == 1){
-    last_CH6_state = 0;
-    input_aux2 = current_count - counter_6;
-  }
-
+void print_tuneYaw(){
+  Serial.print(millis());
+  Serial.print(", ");
+  Serial.print(yaw_desired);
+  Serial.print(", ");
+  Serial.print(yaw_measured);
+  Serial.print(", ");
+  Serial.print(yaw_error);
+  Serial.print(", ");
+  Serial.print(yaw_pid);
+  Serial.print(", ");
+  Serial.print(p_yaw);
+  Serial.print(", ");
+  Serial.print(i_yaw);
+  Serial.print(", ");
+  Serial.print(d_yaw);
+  Serial.println(", ");
 }
